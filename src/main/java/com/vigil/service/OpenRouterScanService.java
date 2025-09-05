@@ -5,35 +5,59 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vigil.domain.Plugin;
 import com.vigil.domain.ScanResult;
 import com.vigil.repository.ScanResultRepository;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class OpenRouterScanService {
 
     private final ScanResultRepository scanResultRepository;
-    private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final RestTemplate restTemplate;
 
     @Value("${openrouter.api.key}")
     private String apiKey;
 
     @Value("${openrouter.base.url}")
     private String baseUrl;
+
+    @Value("${openrouter.timeout.seconds:30}")
+    private int timeoutSeconds;
+
+    public OpenRouterScanService(ScanResultRepository scanResultRepository) {
+        this.scanResultRepository = scanResultRepository;
+        this.restTemplate = createRestTemplate();
+    }
+
+    private RestTemplate createRestTemplate() {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout((int) TimeUnit.SECONDS.toMillis(timeoutSeconds));
+        factory.setReadTimeout((int) TimeUnit.SECONDS.toMillis(timeoutSeconds));
+        
+        RestTemplate template = new RestTemplate();
+        template.setRequestFactory(factory);
+        return template;
+    }
 
     public void scanPlugin(Plugin plugin) {
         log.info("Starting OpenRouter scan for plugin: {} - Type: {}", plugin.getPluginName(), plugin.getSourceType());
@@ -64,50 +88,272 @@ public class OpenRouterScanService {
     private List<ScanResult> scanZipFile(Plugin plugin) throws IOException {
         log.info("Scanning ZIP file: {}", plugin.getSourceLocation());
         
-        // Read ZIP file content (simplified - in real implementation, you'd extract and analyze files)
         File zipFile = new File(plugin.getSourceLocation());
         if (!zipFile.exists()) {
             throw new IOException("ZIP file not found: " + plugin.getSourceLocation());
         }
         
-        String prompt = String.format(
-            "Analyze this ZIP file for security vulnerabilities. " +
-            "File: %s, Size: %d bytes. " +
-            "Look for common security issues like: outdated dependencies, " +
-            "hardcoded secrets, insecure configurations, vulnerable code patterns, SQL injection, XSS, CSRF, etc. " +
-            "For each vulnerability found, provide specific file names, line numbers, and exact code that needs to be changed. " +
-            "Return results in JSON format with array of vulnerabilities, each containing: " +
-            "name, severity (HIGH/MEDIUM/LOW/INFO), description, cvss_score (0.0-10.0), file_path, line_number, " +
-            "vulnerable_code, fixed_code, fix_suggestion, ai_suggestion. " +
-            "The ai_suggestion should include: 1) Specific file and line number, 2) Current vulnerable code, 3) Fixed code, 4) Step-by-step explanation of the fix.",
-            zipFile.getName(), zipFile.length()
-        );
+        // Extract ZIP and collect all relevant file contents
+        String extractPath = extractZipFile(zipFile);
+        StringBuilder allContent = new StringBuilder();
         
-        return callOpenRouter(prompt, plugin);
+        try {
+            List<Path> filesToScan = findRelevantFiles(Paths.get(extractPath));
+            log.info("Found {} files to scan in ZIP", filesToScan.size());
+            
+            // Collect all file contents into a single string
+            for (Path filePath : filesToScan) {
+                try {
+                    String fileContent = Files.readString(filePath);
+                    String relativePath = Paths.get(extractPath).relativize(filePath).toString();
+                    
+                    allContent.append("=== FILE: ").append(relativePath).append(" ===\n");
+                    allContent.append(fileContent).append("\n\n");
+                    
+                    log.debug("Collected content from file: {}", relativePath);
+                    
+                } catch (Exception e) {
+                    log.warn("Failed to read file: {}", filePath, e);
+                }
+            }
+            
+            // Send all content to OpenRouter in one request
+            if (allContent.length() > 0) {
+                log.info("Sending {} characters of code to OpenRouter for analysis", allContent.length());
+                
+                String prompt = String.format(
+                    "Analyze this codebase for security vulnerabilities:\n\n%s\n\n" +
+                    "Look for common security issues like: SQL injection, XSS, CSRF, hardcoded secrets, " +
+                    "insecure configurations, vulnerable code patterns, authentication issues, authorization flaws, etc. " +
+                    "For each vulnerability found, provide specific file names, line numbers, and exact code that needs to be changed. " +
+                    "\n\nIMPORTANT: You MUST respond with ONLY valid JSON. Do not include any text before or after the JSON. " +
+                    "The response must be a JSON array of vulnerabilities with this exact structure:\n" +
+                    "[\n" +
+                    "  {\n" +
+                    "    \"name\": \"Vulnerability Name\",\n" +
+                    "    \"severity\": \"HIGH\",\n" +
+                    "    \"description\": \"Description of the vulnerability\",\n" +
+                    "    \"cvss_score\": 8.5,\n" +
+                    "    \"file_path\": \"path/to/file.java\",\n" +
+                    "    \"line_number\": \"45\",\n" +
+                    "    \"vulnerable_code\": \"String query = \\\"SELECT * FROM users WHERE username = '\\\" + username + \\\"'\\\";\",\n" +
+                    "    \"fixed_code\": \"String query = \\\"SELECT * FROM users WHERE username = ?\\\";\",\n" +
+                    "    \"fix_suggestion\": \"Use parameterized queries\",\n" +
+                    "    \"ai_suggestion\": \"Detailed explanation of the fix\"\n" +
+                    "  }\n" +
+                    "]\n\n" +
+                    "If no vulnerabilities are found, return an empty array: []",
+                    allContent.toString()
+                );
+                
+                List<ScanResult> results = callOpenRouter(prompt, plugin);
+                log.info("OpenRouter analysis completed. Found {} vulnerabilities", results.size());
+                return results;
+            } else {
+                log.warn("No content found to analyze in ZIP file");
+            }
+            
+        } finally {
+            // Clean up extracted files
+            cleanupExtractedFiles(extractPath);
+        }
+        
+        return new ArrayList<>();
     }
 
     private List<ScanResult> scanGitRepository(Plugin plugin) {
         log.info("Scanning Git repository: {}", plugin.getSourceLocation());
         
+        // For Git repositories, we'll analyze the URL and provide a general analysis
+        // In a real implementation, you would clone the repository and scan files
         String prompt = String.format(
-            "Analyze this Git repository for security vulnerabilities. " +
-            "Repository: %s. " +
+            "Analyze this Git repository URL for potential security vulnerabilities: %s. " +
             "Look for common security issues like: outdated dependencies, " +
             "hardcoded secrets, insecure configurations, vulnerable code patterns, SQL injection, XSS, CSRF, etc. " +
-            "For each vulnerability found, provide specific file names, line numbers, and exact code that needs to be changed. " +
-            "Return results in JSON format with array of vulnerabilities, each containing: " +
-            "name, severity (HIGH/MEDIUM/LOW/INFO), description, cvss_score (0.0-10.0), file_path, line_number, " +
-            "vulnerable_code, fixed_code, fix_suggestion, ai_suggestion. " +
-            "The ai_suggestion should include: 1) Specific file and line number, 2) Current vulnerable code, 3) Fixed code, 4) Step-by-step explanation of the fix.",
+            "Provide a general security assessment based on the repository URL and common patterns. " +
+            "\n\nIMPORTANT: You MUST respond with ONLY valid JSON. Do not include any text before or after the JSON. " +
+            "The response must be a JSON array of vulnerabilities with this exact structure:\n" +
+            "[\n" +
+            "  {\n" +
+            "    \"name\": \"Vulnerability Name\",\n" +
+            "    \"severity\": \"HIGH\",\n" +
+            "    \"description\": \"Description of the vulnerability\",\n" +
+            "    \"cvss_score\": 8.5,\n" +
+            "    \"file_path\": \"path/to/file.java\",\n" +
+            "    \"line_number\": \"45\",\n" +
+            "    \"vulnerable_code\": \"String query = \\\"SELECT * FROM users WHERE username = '\\\" + username + \\\"'\\\";\",\n" +
+            "    \"fixed_code\": \"String query = \\\"SELECT * FROM users WHERE username = ?\\\";\",\n" +
+            "    \"fix_suggestion\": \"Use parameterized queries\",\n" +
+            "    \"ai_suggestion\": \"Detailed explanation of the fix\"\n" +
+            "  }\n" +
+            "]\n\n" +
+            "If no vulnerabilities are found, return an empty array: []",
             plugin.getSourceLocation()
         );
         
         return callOpenRouter(prompt, plugin);
     }
 
-    private List<ScanResult> callOpenRouter(String prompt, Plugin plugin) {
+    private String extractZipFile(File zipFile) throws IOException {
+        // Create temporary directory for extraction
+        Path tempDir = Files.createTempDirectory("vigil-scan-");
+        String extractPath = tempDir.toString();
+        
+        log.info("Extracting ZIP file {} to: {}", zipFile.getName(), extractPath);
+        
+        try (ZipInputStream zipIn = new ZipInputStream(new FileInputStream(zipFile))) {
+            ZipEntry entry = zipIn.getNextEntry();
+            int fileCount = 0;
+            final int MAX_FILES = 1000; // Prevent ZIP bombs
+            
+            while (entry != null && fileCount < MAX_FILES) {
+                String entryName = entry.getName();
+                
+                // Security check: prevent directory traversal attacks
+                if (entryName.contains("..") || entryName.startsWith("/")) {
+                    log.warn("Skipping potentially malicious entry: {}", entryName);
+                    zipIn.closeEntry();
+                    entry = zipIn.getNextEntry();
+                    continue;
+                }
+                
+                String filePath = extractPath + File.separator + entryName;
+                Path targetPath = Paths.get(filePath);
+                
+                // Ensure the target path is within the extraction directory
+                if (!targetPath.normalize().startsWith(Paths.get(extractPath).normalize())) {
+                    log.warn("Skipping entry outside extraction directory: {}", entryName);
+                    zipIn.closeEntry();
+                    entry = zipIn.getNextEntry();
+                    continue;
+                }
+                
+                if (!entry.isDirectory()) {
+                    // Create parent directories if they don't exist
+                    File file = new File(filePath);
+                    File parentDir = file.getParentFile();
+                    if (parentDir != null && !parentDir.exists()) {
+                        parentDir.mkdirs();
+                    }
+                    
+                    // Extract file
+                    try (var fos = Files.newOutputStream(targetPath)) {
+                        byte[] buffer = new byte[4096];
+                        int len;
+                        while ((len = zipIn.read(buffer)) > 0) {
+                            fos.write(buffer, 0, len);
+                        }
+                    }
+                    
+                    log.debug("Extracted file: {}", entryName);
+                    fileCount++;
+                } else {
+                    // Create directory
+                    File dir = new File(filePath);
+                    if (!dir.exists()) {
+                        dir.mkdirs();
+                    }
+                }
+                
+                zipIn.closeEntry();
+                entry = zipIn.getNextEntry();
+            }
+            
+            if (fileCount >= MAX_FILES) {
+                log.warn("ZIP extraction stopped at {} files to prevent ZIP bomb", MAX_FILES);
+            }
+            log.info("ZIP extraction completed. Extracted {} files to: {}", fileCount, extractPath);
+
+        }
+        
+        return extractPath;
+    }
+
+    private List<Path> findRelevantFiles(Path directory) throws IOException {
+        List<Path> relevantFiles = new ArrayList<>();
+        
+        try (Stream<Path> paths = Files.walk(directory)) {
+            paths.filter(Files::isRegularFile)
+                 .filter(this::isRelevantFile)
+                 .forEach(relevantFiles::add);
+        }
+        
+        return relevantFiles;
+    }
+
+    private boolean isRelevantFile(Path file) {
+        String fileName = file.getFileName().toString().toLowerCase();
+        String extension = getFileExtension(fileName);
+        
+        // Include common source code and configuration files
+        return extension.matches("(java|js|ts|jsx|tsx|py|php|go|cs|cpp|c|h|xml|json|yml|yaml|properties|conf|config|sql|sh|bat|ps1)") ||
+               fileName.matches("(pom\\.xml|package\\.json|requirements\\.txt|Dockerfile|docker-compose\\.yml|Makefile|README\\.md)");
+    }
+
+    private String getFileExtension(String fileName) {
+        int lastDot = fileName.lastIndexOf('.');
+        return lastDot > 0 ? fileName.substring(lastDot + 1) : "";
+    }
+
+    private List<ScanResult> scanFileContent(String fileContent, String filePath, Plugin plugin) {
         try {
-            log.info("Calling OpenRouter API for vulnerability analysis");
+            // Limit file content size to avoid token limits
+            if (fileContent.length() > 10000) {
+                fileContent = fileContent.substring(0, 10000) + "\n... [Content truncated for analysis]";
+            }
+            
+            String prompt = String.format(
+                "Analyze this source code file for security vulnerabilities:\n\n" +
+                "File: %s\n" +
+                "Content:\n%s\n\n" +
+                "Look for common security issues like: SQL injection, XSS, CSRF, hardcoded secrets, " +
+                "insecure configurations, vulnerable code patterns, authentication issues, authorization flaws, etc. " +
+                "For each vulnerability found, provide specific line numbers and exact code that needs to be changed. " +
+                "Return results in JSON format with array of vulnerabilities, each containing: " +
+                "name, severity (HIGH/MEDIUM/LOW/INFO), description, cvss_score (0.0-10.0), file_path, line_number, " +
+                "vulnerable_code, fixed_code, fix_suggestion, ai_suggestion.",
+                filePath, fileContent
+            );
+            
+            return callOpenRouter(prompt, plugin);
+            
+        } catch (Exception e) {
+            log.warn("Failed to scan file content: {}", filePath, e);
+            return new ArrayList<>();
+        }
+    }
+
+    private void cleanupExtractedFiles(String extractPath) {
+        try {
+            Path path = Paths.get(extractPath);
+            if (Files.exists(path)) {
+                Files.walk(path)
+                     .sorted(Comparator.reverseOrder())
+                     .map(Path::toFile)
+                     .forEach(File::delete);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to cleanup extracted files: {}", extractPath, e);
+        }
+    }
+
+    private List<ScanResult> callOpenRouter(String prompt, Plugin plugin) {
+        // Try multiple models in case one is not available
+        String[] models = {
+            "meta-llama/llama-3.1-8b-instruct",
+            "meta-llama/llama-3.1-70b-instruct", 
+            "openai/gpt-3.5-turbo",
+            "anthropic/claude-3-haiku"
+        };
+        
+        for (String model : models) {
+            try {
+                log.info("Calling OpenRouter API with model: {}", model);
+                
+                // Validate API key
+                if (apiKey == null || apiKey.trim().isEmpty()) {
+                    throw new RuntimeException("OpenRouter API key is not configured");
+                }
             
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
@@ -116,7 +362,7 @@ public class OpenRouterScanService {
             headers.set("X-Title", "Vigil Security Scanner");
 
             Map<String, Object> requestBody = new HashMap<>();
-            requestBody.put("model", "meta-llama/llama-3.1-8b-instruct:free");
+                requestBody.put("model", model);
             requestBody.put("messages", Arrays.asList(
                 Map.of("role", "user", "content", prompt)
             ));
@@ -131,20 +377,31 @@ public class OpenRouterScanService {
             Map<String, Object> response = restTemplate.postForObject(url, entity, Map.class);
             
             if (response == null) {
-                log.warn("OpenRouter returned null response");
-                return new ArrayList<>();
+                    log.warn("OpenRouter returned null response for model: {}", model);
+                    continue; // Try next model
             }
             
             String content = extractContentFromResponse(response);
-            log.info("OpenRouter response received (length: {})", content.length());
+                log.info("OpenRouter response received (length: {}) for model: {}", content.length(), model);
             log.debug("OpenRouter response content: {}", content);
             
             return parseVulnerabilitiesFromResponse(content, plugin);
             
+            } catch (RestClientException e) {
+                log.warn("OpenRouter API call failed for model {}: {}", model, e.getMessage());
+                if (e.getMessage().contains("404")) {
+                    continue; // Try next model
+                } else {
+                    throw new RuntimeException("Failed to call OpenRouter API: " + e.getMessage(), e);
+                }
         } catch (Exception e) {
-            log.error("OpenRouter API call failed, using fallback mock data for testing", e);
-            return generateFallbackVulnerabilities(plugin);
+                log.warn("Unexpected error with model {}: {}", model, e.getMessage());
+                continue; // Try next model
+            }
         }
+        
+        // If all models failed
+        throw new RuntimeException("All OpenRouter models failed. Please check your API key and available models.");
     }
 
     private String extractContentFromResponse(Map<String, Object> response) {
@@ -166,8 +423,13 @@ public class OpenRouterScanService {
         
         try {
             log.debug("Attempting to parse OpenRouter response as JSON");
-            // Try to parse as JSON first
-            JsonNode root = objectMapper.readTree(content);
+            log.debug("Response content: {}", content);
+            
+            // Try to extract JSON from the response if it contains text before/after
+            String jsonContent = extractJsonFromResponse(content);
+            
+            // Try to parse as JSON
+            JsonNode root = objectMapper.readTree(jsonContent);
             log.debug("Parsed JSON root type: {}", root.getNodeType());
             
             if (root.isArray()) {
@@ -190,13 +452,102 @@ public class OpenRouterScanService {
                 log.warn("No vulnerabilities array found in JSON response. Root keys: {}", root.fieldNames());
             }
         } catch (Exception e) {
-            log.warn("Failed to parse OpenRouter response as JSON, using fallback mock data", e);
-            return generateFallbackVulnerabilities(plugin);
+            log.warn("Failed to parse OpenRouter response as JSON: {}", e.getMessage());
+            log.debug("Response content that failed to parse: {}", content);
+            
+            // Try to create a basic vulnerability from the text response
+            if (content.toLowerCase().contains("vulnerability") || content.toLowerCase().contains("security")) {
+                log.info("Attempting to create basic vulnerability from text response");
+                return createBasicVulnerabilityFromText(content, plugin);
+            }
+            
+            return new ArrayList<>();
         }
         
         // If no vulnerabilities found, return empty list
         if (results.isEmpty()) {
             log.info("No vulnerabilities found in OpenRouter response");
+        }
+        
+        return results;
+    }
+    
+    private String extractJsonFromResponse(String content) {
+        // Look for JSON array or object in the response
+        int jsonStart = -1;
+        int jsonEnd = -1;
+        
+        // Find the start of JSON (look for [ or {)
+        for (int i = 0; i < content.length(); i++) {
+            char c = content.charAt(i);
+            if (c == '[' || c == '{') {
+                jsonStart = i;
+                break;
+            }
+        }
+        
+        if (jsonStart == -1) {
+            log.warn("No JSON found in response, returning original content");
+            return content;
+        }
+        
+        // Find the matching closing bracket/brace
+        int braceCount = 0;
+        boolean inString = false;
+        char startChar = content.charAt(jsonStart);
+        char endChar = (startChar == '[') ? ']' : '}';
+        
+        for (int i = jsonStart; i < content.length(); i++) {
+            char c = content.charAt(i);
+            
+            if (c == '"' && (i == 0 || content.charAt(i-1) != '\\')) {
+                inString = !inString;
+            }
+            
+            if (!inString) {
+                if (c == startChar) {
+                    braceCount++;
+                } else if (c == endChar) {
+                    braceCount--;
+                    if (braceCount == 0) {
+                        jsonEnd = i + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if (jsonEnd == -1) {
+            log.warn("Could not find matching closing bracket, returning original content");
+            return content;
+        }
+        
+        String jsonContent = content.substring(jsonStart, jsonEnd);
+        log.debug("Extracted JSON content: {}", jsonContent);
+        return jsonContent;
+    }
+    
+    private List<ScanResult> createBasicVulnerabilityFromText(String content, Plugin plugin) {
+        List<ScanResult> results = new ArrayList<>();
+        
+        try {
+            // Create a basic vulnerability from the text response
+            ScanResult basicVuln = ScanResult.builder()
+                    .plugin(plugin)
+                    .severity("INFO")
+                    .vulnerabilityId("AI Analysis Result")
+                    .vulnerabilityName("Security Analysis Report")
+                    .cvssScore(0.0)
+                    .description("AI analysis completed. Please review the full response for detailed findings.")
+                    .fixSuggestion("Review the analysis and implement recommended security improvements.")
+                    .aiSuggestion("AI Response:\n" + content)
+                    .build();
+            
+            results.add(basicVuln);
+            log.info("Created basic vulnerability from text response");
+            
+        } catch (Exception e) {
+            log.warn("Failed to create basic vulnerability from text", e);
         }
         
         return results;
@@ -254,68 +605,5 @@ public class OpenRouterScanService {
         }
     }
 
-    private List<ScanResult> generateFallbackVulnerabilities(Plugin plugin) {
-        log.info("Generating fallback vulnerabilities for testing");
-        
-        List<ScanResult> fallbackResults = new ArrayList<>();
-        
-        // Add a realistic vulnerability example
-        ScanResult vuln1 = ScanResult.builder()
-                .plugin(plugin)
-                .severity("HIGH")
-                .vulnerabilityId("SQL Injection Vulnerability")
-                .vulnerabilityName("SQL Injection in User Authentication")
-                .cvssScore(8.5)
-                .description("Direct SQL query construction without parameterized statements detected. This could lead to SQL injection attacks.")
-                .fixSuggestion("Use parameterized queries or prepared statements to prevent SQL injection.")
-                .aiSuggestion("📍 File: src/main/java/com/example/UserController.java (Line 45)\n\n" +
-                        "🔴 Current Vulnerable Code:\n" +
-                        "```java\n" +
-                        "String query = \"SELECT * FROM users WHERE username = '\" + username + \"' AND password = '\" + password + \"'\";\n" +
-                        "Statement stmt = connection.createStatement();\n" +
-                        "ResultSet rs = stmt.executeQuery(query);\n" +
-                        "```\n\n" +
-                        "🟢 Fixed Code:\n" +
-                        "```java\n" +
-                        "String query = \"SELECT * FROM users WHERE username = ? AND password = ?\";\n" +
-                        "PreparedStatement stmt = connection.prepareStatement(query);\n" +
-                        "stmt.setString(1, username);\n" +
-                        "stmt.setString(2, password);\n" +
-                        "ResultSet rs = stmt.executeQuery();\n" +
-                        "```\n\n" +
-                        "💡 Detailed Explanation:\n" +
-                        "The vulnerable code directly concatenates user input into SQL queries, making it susceptible to SQL injection attacks. The fixed code uses parameterized queries where user input is passed as parameters, preventing malicious SQL code injection.")
-                .build();
-        
-        fallbackResults.add(vuln1);
-        
-        // Add another realistic vulnerability
-        ScanResult vuln2 = ScanResult.builder()
-                .plugin(plugin)
-                .severity("MEDIUM")
-                .vulnerabilityId("Hardcoded Secret")
-                .vulnerabilityName("API Key Hardcoded in Source Code")
-                .cvssScore(6.2)
-                .description("API key found hardcoded in the source code. This poses a security risk if the code is shared or committed to version control.")
-                .fixSuggestion("Move sensitive credentials to environment variables or secure configuration files.")
-                .aiSuggestion("📍 File: src/main/resources/config.properties (Line 12)\n\n" +
-                        "🔴 Current Vulnerable Code:\n" +
-                        "```properties\n" +
-                        "api.key=sk-1234567890abcdef\n" +
-                        "database.password=mysecretpassword\n" +
-                        "```\n\n" +
-                        "🟢 Fixed Code:\n" +
-                        "```properties\n" +
-                        "api.key=${API_KEY}\n" +
-                        "database.password=${DB_PASSWORD}\n" +
-                        "```\n\n" +
-                        "💡 Detailed Explanation:\n" +
-                        "Hardcoded secrets in source code are a major security risk. The fixed approach uses environment variables that are loaded at runtime, keeping sensitive data out of the codebase. Make sure to add these environment variables to your deployment configuration.")
-                .build();
-        
-        fallbackResults.add(vuln2);
-        
-        return fallbackResults;
-    }
 
 }
